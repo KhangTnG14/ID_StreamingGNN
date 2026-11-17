@@ -1,0 +1,16 @@
+Attack_Type,Total_Samples,Detected_Correct,Missed_Errors,Recall_%,Miss_Rate_%
+DoS Hulk,34661,20234,14427,58.38,41.62
+BENIGN,340938,339978,960,99.72,0.28
+Bot,295,72,223,24.41,75.59
+DoS Slowhttptest,825,732,93,88.73,11.27
+Infiltration,6,0,6,0.0,100.0
+DoS GoldenEye,1544,1544,0,100.0,0.0
+DDoS,19205,19205,0,100.0,0.0
+DoS slowloris,870,870,0,100.0,0.0
+FTP-Patator,1191,1191,0,100.0,0.0
+Heartbleed,2,2,0,100.0,0.0
+PortScan,23840,23840,0,100.0,0.0
+SSH-Patator,885,885,0,100.0,0.0
+Web Attack - Brute Force,227,227,0,100.0,0.0
+Web Attack - Sql Injection,4,4,0,100.0,0.0
+Web Attack - XSS,98,98,0,100.0,0.0
