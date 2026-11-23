@@ -1,0 +1,16 @@
+label,n,predicted_attack,rate_predicted_attack
+BENIGN,340934,74,0.00021705080748766624
+DoS Hulk,34661,34654,0.9997980439110239
+PortScan,23839,23839,1.0
+DDoS,19204,19200,0.9997917100604041
+DoS GoldenEye,1544,1523,0.9863989637305699
+FTP-Patator,1191,1191,1.0
+SSH-Patator,885,884,0.9988700564971752
+DoS slowloris,869,869,1.0
+DoS Slowhttptest,825,781,0.9466666666666667
+Bot,295,96,0.3254237288135593
+Web Attack - Brute Force,226,226,1.0
+Web Attack - XSS,98,98,1.0
+Infiltration,5,5,1.0
+Web Attack - Sql Injection,3,3,1.0
+Heartbleed,2,0,0.0
