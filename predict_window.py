@@ -67,7 +67,7 @@ class EGraphSAGEModel(nn.Module):
 
 
 class StreamingIDSPredictor:
-    def __init__(self, bundle_dir="."):
+    def __init__(self, bundle_dir="models"):
         with open(f"{bundle_dir}/metadata.json", "r", encoding="utf-8") as f:
             self.meta = json.load(f)
 
@@ -84,7 +84,7 @@ class StreamingIDSPredictor:
             hidden_dim=self.meta["hidden_dim"],
             dropout=self.meta["dropout"],
         ).to(self.device)
-        state = torch.load(f"{bundle_dir}/best_egraphsage.pt", map_location=self.device)
+        state = torch.load(f"{bundle_dir}/checkpoint.pth", map_location=self.device)
         self.model.load_state_dict(state)
         self.model.eval()
 
@@ -92,14 +92,18 @@ class StreamingIDSPredictor:
         df = df_window.copy()
         df.columns = [c.strip() for c in df.columns]
 
-        X = df[self.feature_cols].replace([np.inf, -np.inf], np.nan)
-        X = X.fillna(self.medians).astype(np.float32)
+        X = df[self.feature_cols].apply(pd.to_numeric, errors="coerce")
+        X = X.replace([np.inf, -np.inf], np.nan).fillna(self.medians).astype(np.float32)
+        X = X.replace([np.inf, -np.inf], np.nan).fillna(self.medians).astype(np.float32)
         X_scaled = self.scaler.transform(X).astype(np.float32)
 
-        ips = pd.Index(pd.concat([df["Source IP"], df["Destination IP"]]).unique())
+        src_col = "src_ip" if "src_ip" in df.columns else "Source IP"
+        dst_col = "dst_ip" if "dst_ip" in df.columns else "Destination IP"
+
+        ips = pd.Index(pd.concat([df[src_col].astype(str), df[dst_col].astype(str)]).unique())
         num_nodes = len(ips)
-        src_t = torch.tensor(ips.get_indexer(df["Source IP"]), dtype=torch.long)
-        dst_t = torch.tensor(ips.get_indexer(df["Destination IP"]), dtype=torch.long)
+        src_t = torch.tensor(ips.get_indexer(df[src_col].astype(str)), dtype=torch.long)
+        dst_t = torch.tensor(ips.get_indexer(df[dst_col].astype(str)), dtype=torch.long)
         edge_index = torch.stack([src_t, dst_t], dim=0)
         edge_attr = torch.tensor(X_scaled, dtype=torch.float32)
 
