@@ -1,122 +1,118 @@
-import os
+import json
 import joblib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch_geometric.data import Data
 from torch_geometric.nn import SAGEConv
+from torch_geometric.utils import scatter
+
 
 class EGraphSAGEConv(nn.Module):
-    def __init__(self, node_dim, edge_dim, out_dim):
+    def __init__(self, node_in_dim, edge_dim, out_dim):
         super().__init__()
-        self.sage = SAGEConv(node_dim + edge_dim, out_dim, aggr="max")
-        self.norm = nn.BatchNorm1d(out_dim)
+        self.sage = SAGEConv(node_in_dim + edge_dim, out_dim, aggr="max")
+        self.bn = nn.BatchNorm1d(out_dim)
+        self.act = nn.LeakyReLU(0.2)
 
     def forward(self, x, edge_index, edge_attr):
-        row, col = edge_index
-        agg_edge = torch.zeros((x.size(0), edge_attr.size(1)), device=x.device)
-        agg_edge.index_add_(0, col, edge_attr)
-        agg_edge.index_add_(0, row, edge_attr)
-        
-        deg = (torch.bincount(col, minlength=x.size(0)) + torch.bincount(row, minlength=x.size(0))).clamp(min=1).unsqueeze(1).float()
-        agg_edge = agg_edge / deg
-        
-        h = torch.cat([x, agg_edge], dim=-1)
-        return F.leaky_relu(self.norm(self.sage(h, edge_index)), negative_slope=0.1)
+        src, dst = edge_index
+        num_nodes = x.size(0)
+        edge_ends = torch.cat([src, dst], dim=0)
+        edge_feats = torch.cat([edge_attr, edge_attr], dim=0)
+        agg_edge = scatter(edge_feats, edge_ends, dim=0, dim_size=num_nodes, reduce="mean")
+        x_aug = torch.cat([x, agg_edge], dim=-1)
+        out = self.sage(x_aug, edge_index)
+        return self.act(self.bn(out))
+
 
 class EGraphSAGEModel(nn.Module):
-    def __init__(self, in_dim, hidden_dim=128):
+    def __init__(self, node_dim, edge_dim, hidden_dim=128, dropout=0.3):
         super().__init__()
-        self.conv1 = EGraphSAGEConv(in_dim, in_dim, hidden_dim)
-        self.conv2 = EGraphSAGEConv(hidden_dim, in_dim, hidden_dim)
-        self.dropout = nn.Dropout(0.1)
-        
-        self.edge_encoder = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
+        self.conv1 = EGraphSAGEConv(node_dim, edge_dim, hidden_dim)
+        self.conv2 = EGraphSAGEConv(hidden_dim, edge_dim, hidden_dim)
+
+        self.edge_enc = nn.Sequential(
+            nn.Linear(edge_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
-            nn.LeakyReLU(0.1)
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.BatchNorm1d(hidden_dim),
+            nn.LeakyReLU(0.2),
         )
-        
+
         self.classifier = nn.Sequential(
             nn.Linear(hidden_dim * 3, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
-            nn.LeakyReLU(0.1),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, 1)
+            nn.LeakyReLU(0.2),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 1),
         )
 
-    def forward(self, x, edge_index, edge_attr):
-        x = torch.clamp(x, -10.0, 10.0)
-        edge_attr = torch.clamp(edge_attr, -10.0, 10.0)
-        
+    def forward(self, data):
+        x = torch.clamp(data.x, -25.0, 25.0)
+        edge_attr = torch.clamp(data.edge_attr, -25.0, 25.0)
+        edge_index = data.edge_index
+
         h = self.conv1(x, edge_index, edge_attr)
-        h = self.dropout(h)
         h = self.conv2(h, edge_index, edge_attr)
-        
+
         src, dst = edge_index
-        e_emb = self.edge_encoder(edge_attr)
-        edge_rep = torch.cat([h[src], h[dst], e_emb], dim=-1)
-        return self.classifier(edge_rep).squeeze(-1)
+        e_emb = self.edge_enc(edge_attr)
 
-_CACHE = {}
+        out = torch.cat([h[src], h[dst], e_emb], dim=-1)
+        return self.classifier(out).squeeze(-1)
 
-def predict_window(
-    df_batch: pd.DataFrame,
-    checkpoint_path: str = "models/checkpoint.pth",
-    preprocessor_path: str = "processed/preprocessor.joblib",
-    threshold: float = 0.15
-):
-    """
-    Hàm suy luận Streaming cho 1 cửa sổ/batch dữ liệu mạng (DataFrame).
-    Trả về:
-        - preds: mảng numpy 0 (Normal) / 1 (Attack)
-        - probs: mảng numpy xác suất tấn công tương ứng từng dòng
-    """
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    if "prep" not in _CACHE:
-        _CACHE["prep"] = joblib.load(preprocessor_path)
-    prep = _CACHE["prep"]
-    
-    feature_cols = prep["feature_cols"] if isinstance(prep, dict) else prep.feature_names_in_
-    scaler = prep["scaler"] if isinstance(prep, dict) else prep
-    
-    X_raw = df_batch[feature_cols].replace([np.inf, -np.inf], np.nan).fillna(0.0)
-    X_scaled = scaler.transform(X_raw).astype(np.float32)
-    in_dim = X_scaled.shape[1]
-    
-    if "model" not in _CACHE:
-        model = EGraphSAGEModel(in_dim=in_dim, hidden_dim=128).to(device)
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        model.eval()
-        _CACHE["model"] = model
-    model = _CACHE["model"]
-    
-    src_col = "src_ip" if "src_ip" in df_batch.columns else "Source IP"
-    dst_col = "dst_ip" if "dst_ip" in df_batch.columns else "Destination IP"
-    s_ip = df_batch[src_col].astype(str).to_numpy()
-    d_ip = df_batch[dst_col].astype(str).to_numpy()
-    
-    unique_ips, inv_idx = np.unique(np.concatenate([s_ip, d_ip]), return_inverse=True)
-    n_edges = len(df_batch)
-    src_idx = torch.tensor(inv_idx[:n_edges], dtype=torch.long, device=device)
-    dst_idx = torch.tensor(inv_idx[n_edges:], dtype=torch.long, device=device)
-    
-    edge_index = torch.stack([src_idx, dst_idx], dim=0)
-    edge_attr = torch.tensor(X_scaled, dtype=torch.float32, device=device)
-    num_nodes = len(unique_ips)
-    
-    node_sum = torch.zeros((num_nodes, in_dim), dtype=torch.float32, device=device)
-    node_cnt = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
-    node_sum.index_add_(0, src_idx, edge_attr)
-    node_sum.index_add_(0, dst_idx, edge_attr)
-    node_cnt.index_add_(0, src_idx, torch.ones((n_edges, 1), device=device))
-    node_cnt.index_add_(0, dst_idx, torch.ones((n_edges, 1), device=device))
-    x = node_sum / node_cnt.clamp(min=1.0)
-    
-    with torch.no_grad():
-        probs = torch.sigmoid(model(x, edge_index, edge_attr)).cpu().numpy()
-        
-    preds = (probs >= threshold).astype(int)
-    return preds, probs
+
+class StreamingIDSPredictor:
+    def __init__(self, bundle_dir="."):
+        with open(f"{bundle_dir}/metadata.json", "r", encoding="utf-8") as f:
+            self.meta = json.load(f)
+
+        self.feature_cols = self.meta["feature_cols"]
+        self.threshold = self.meta["best_threshold"]
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        self.scaler = joblib.load(f"{bundle_dir}/scaler.joblib")
+        self.medians = joblib.load(f"{bundle_dir}/medians.joblib")
+
+        self.model = EGraphSAGEModel(
+            node_dim=self.meta["node_dim"],
+            edge_dim=self.meta["edge_dim"],
+            hidden_dim=self.meta["hidden_dim"],
+            dropout=self.meta["dropout"],
+        ).to(self.device)
+        state = torch.load(f"{bundle_dir}/best_egraphsage.pt", map_location=self.device)
+        self.model.load_state_dict(state)
+        self.model.eval()
+
+    def predict_window(self, df_window: pd.DataFrame) -> pd.DataFrame:
+        df = df_window.copy()
+        df.columns = [c.strip() for c in df.columns]
+
+        X = df[self.feature_cols].replace([np.inf, -np.inf], np.nan)
+        X = X.fillna(self.medians).astype(np.float32)
+        X_scaled = self.scaler.transform(X).astype(np.float32)
+
+        ips = pd.Index(pd.concat([df["Source IP"], df["Destination IP"]]).unique())
+        num_nodes = len(ips)
+        src_t = torch.tensor(ips.get_indexer(df["Source IP"]), dtype=torch.long)
+        dst_t = torch.tensor(ips.get_indexer(df["Destination IP"]), dtype=torch.long)
+        edge_index = torch.stack([src_t, dst_t], dim=0)
+        edge_attr = torch.tensor(X_scaled, dtype=torch.float32)
+
+        edge_ends = torch.cat([src_t, dst_t], dim=0)
+        edge_feats_dup = torch.cat([edge_attr, edge_attr], dim=0)
+        node_mean = scatter(edge_feats_dup, edge_ends, dim=0, dim_size=num_nodes, reduce="mean")
+        node_max = scatter(edge_feats_dup, edge_ends, dim=0, dim_size=num_nodes, reduce="max")
+        node_x = torch.cat([node_mean, node_max], dim=-1)
+
+        data = Data(x=node_x, edge_index=edge_index, edge_attr=edge_attr).to(self.device)
+        with torch.no_grad():
+            probs = torch.sigmoid(self.model(data)).cpu().numpy()
+
+        df["attack_prob"] = probs
+        df["pred_label"] = (probs >= self.threshold).astype(int)
+        return df

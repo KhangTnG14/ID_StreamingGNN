@@ -7,6 +7,8 @@ import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from predict_window import EGraphSAGEModel
+from torch_geometric.data import Data
+from torch_geometric.utils import scatter
 
 app = FastAPI(title="E-GraphSAGE Streaming IDS API")
 app.add_middleware(
@@ -23,26 +25,52 @@ print("Đang nạp dữ liệu Test và trọng số E-GraphSAGE...")
 X_te = pd.read_parquet("processed/test_features.parquet")
 m_te = pd.read_parquet("processed/test_meta.parquet")
 
+# Đọc metadata nếu có để đồng bộ ngưỡng & cấu hình
+try:
+    with open("models/metadata.json", "r", encoding="utf-8") as f:
+        META = json.load(f)
+except Exception:
+    META = {}
+
 # Sắp xếp đúng theo dòng thời gian thực
 order = np.argsort(m_te["timestamp"].to_numpy())
 X_arr = X_te.to_numpy(dtype=np.float32)[order]
 m_sorted = m_te.iloc[order].reset_index(drop=True)
 
 in_dim = X_arr.shape[1]
-model = EGraphSAGEModel(in_dim=in_dim, hidden_dim=128).to(device)
+node_dim = META.get("node_dim", in_dim * 2)  # 140 (70 mean + 70 max)
+edge_dim = META.get("edge_dim", in_dim)  # 70
+hidden_dim = META.get("hidden_dim", 128)
+dropout = META.get("dropout", 0.3)
+default_threshold = float(META.get("best_threshold", 0.50))
+
+model = EGraphSAGEModel(
+    node_dim=node_dim,
+    edge_dim=edge_dim,
+    hidden_dim=hidden_dim,
+    dropout=dropout,
+).to(device)
 model.load_state_dict(torch.load("models/checkpoint.pth", map_location=device))
 model.eval()
-print(f"Đã sẵn sàng! Tổng số flows: {len(X_arr):,} | Thiết bị: {device}")
+print(
+    f"Đã sẵn sàng! Tổng số flows: {len(X_arr):,} | Threshold mặc định:"
+    f" {default_threshold} | Thiết bị: {device}"
+)
 
 
 @app.get("/api/summary")
 def get_summary():
     """Trả về thông số tổng quan offline của mô hình cho header dashboard"""
     try:
-        with open("results/graphsage_test_metrics.json") as f:
+        with open("results/graphsage_test_metrics.json", "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"f1": 0.8977, "precision": 0.9863, "recall": 0.8237, "fpr": 0.0028}
+        return {
+            "f1": 0.9248,
+            "precision": 0.9551,
+            "recall": 0.8964,
+            "fpr": 0.0103,
+        }
 
 
 @app.websocket("/ws/stream")
@@ -51,7 +79,7 @@ async def stream_ids(websocket: WebSocket):
 
     # Tham số mặc định có thể điều chỉnh từ UI
     window_size = 2000
-    threshold = 0.15
+    threshold = default_threshold
     speed_sec = 1.0
     is_running = True
     cursor = 0
@@ -73,9 +101,13 @@ async def stream_ids(websocket: WebSocket):
                     speed_sec = float(msg.get("speed_sec", speed_sec))
                 elif action == "jump_attack":
                     # Nhảy nhanh tới vùng có tấn công để demo trực tiếp
-                    atk_indices = np.where(m_sorted["label_bin"].to_numpy() == 1)[0]
+                    atk_indices = np.where(
+                        m_sorted["label_bin"].to_numpy() == 1
+                    )[0]
                     if len(atk_indices) > 0:
-                        cursor = max(0, int(atk_indices[len(atk_indices) // 3]) - 200)
+                        cursor = max(
+                            0, int(atk_indices[len(atk_indices) // 3]) - 200
+                        )
         except (WebSocketDisconnect, RuntimeError):
             pass
 
@@ -97,27 +129,46 @@ async def stream_ids(websocket: WebSocket):
 
             t0 = time.perf_counter()
 
-            # Dựng đồ thị cửa sổ
+            # Dựng đồ thị cửa sổ đồng bộ với kiến trúc mới (mean + max node features)
             s_ip = batch_meta["src_ip"].astype(str).to_numpy()
             d_ip = batch_meta["dst_ip"].astype(str).to_numpy()
-            unique_ips, inv_idx = np.unique(np.concatenate([s_ip, d_ip]), return_inverse=True)
+            unique_ips, inv_idx = np.unique(
+                np.concatenate([s_ip, d_ip]), return_inverse=True
+            )
             n_edges = end - cursor
-            src_idx = torch.tensor(inv_idx[:n_edges], dtype=torch.long, device=device)
-            dst_idx = torch.tensor(inv_idx[n_edges:], dtype=torch.long, device=device)
+            src_idx = torch.tensor(
+                inv_idx[:n_edges], dtype=torch.long, device=device
+            )
+            dst_idx = torch.tensor(
+                inv_idx[n_edges:], dtype=torch.long, device=device
+            )
             edge_index = torch.stack([src_idx, dst_idx], dim=0)
-            edge_attr = torch.tensor(batch_X, dtype=torch.float32, device=device)
+            edge_attr = torch.tensor(
+                batch_X, dtype=torch.float32, device=device
+            )
             num_nodes = len(unique_ips)
 
-            node_sum = torch.zeros((num_nodes, in_dim), dtype=torch.float32, device=device)
-            node_cnt = torch.zeros((num_nodes, 1), dtype=torch.float32, device=device)
-            node_sum.index_add_(0, src_idx, edge_attr)
-            node_sum.index_add_(0, dst_idx, edge_attr)
-            node_cnt.index_add_(0, src_idx, torch.ones((n_edges, 1), device=device))
-            node_cnt.index_add_(0, dst_idx, torch.ones((n_edges, 1), device=device))
-            x = node_sum / node_cnt.clamp(min=1.0)
+            edge_ends = torch.cat([src_idx, dst_idx], dim=0)
+            edge_feats_dup = torch.cat([edge_attr, edge_attr], dim=0)
+            node_mean = scatter(
+                edge_feats_dup,
+                edge_ends,
+                dim=0,
+                dim_size=num_nodes,
+                reduce="mean",
+            )
+            node_max = scatter(
+                edge_feats_dup,
+                edge_ends,
+                dim=0,
+                dim_size=num_nodes,
+                reduce="max",
+            )
+            x = torch.cat([node_mean, node_max], dim=-1)  # (num_nodes, 140)
 
+            data = Data(x=x, edge_index=edge_index, edge_attr=edge_attr)
             with torch.no_grad():
-                probs = torch.sigmoid(model(x, edge_index, edge_attr)).cpu().numpy()
+                probs = torch.sigmoid(model(data)).cpu().numpy()
 
             latency_ms = (time.perf_counter() - t0) * 1000.0
             throughput = int(n_edges / max(latency_ms / 1000.0, 1e-4))
@@ -139,22 +190,40 @@ async def stream_ids(websocket: WebSocket):
                     victims.add(v)
                 key = (u, v)
                 if key not in edge_map:
-                    edge_map[key] = {"source": u, "target": v, "is_atk": is_atk, "count": 1}
+                    edge_map[key] = {
+                        "source": u,
+                        "target": v,
+                        "is_atk": is_atk,
+                        "count": 1,
+                    }
                 else:
                     edge_map[key]["count"] += 1
-                    edge_map[key]["is_atk"] = edge_map[key]["is_atk"] or is_atk
+                    edge_map[key]["is_atk"] = (
+                        edge_map[key]["is_atk"] or is_atk
+                    )
 
             important = list(attackers | victims)
-            others = [ip for ip in unique_ips if ip not in attackers and ip not in victims]
-            kept_ips = set(important[:30] + others[: max(0, 40 - len(important[:30]))])
+            others = [
+                ip
+                for ip in unique_ips
+                if ip not in attackers and ip not in victims
+            ]
+            kept_ips = set(
+                important[:30] + others[: max(0, 40 - len(important[:30]))]
+            )
 
             nodes = []
             for ip in kept_ips:
-                role = "attacker" if ip in attackers else ("victim" if ip in victims else "normal")
+                role = (
+                    "attacker"
+                    if ip in attackers
+                    else ("victim" if ip in victims else "normal")
+                )
                 nodes.append({"id": ip, "role": role})
 
             links = [
-                e for e in edge_map.values()
+                e
+                for e in edge_map.values()
                 if e["source"] in kept_ips and e["target"] in kept_ips
             ][:120]
 

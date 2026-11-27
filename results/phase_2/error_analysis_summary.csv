@@ -1,16 +1,16 @@
 Attack_Type,Total_Samples,Detected_Correct,Missed_Errors,Recall_%,Miss_Rate_%
-DoS Hulk,34661,20234,14427,58.38,41.62
-BENIGN,340938,339978,960,99.72,0.28
-Bot,295,72,223,24.41,75.59
-DoS Slowhttptest,825,732,93,88.73,11.27
+DoS Hulk,34661,31048,3613,89.58,10.42
+BENIGN,340938,337410,3528,98.97,1.03
+PortScan,23840,20693,3147,86.8,13.2
+FTP-Patator,1191,491,700,41.23,58.77
+SSH-Patator,885,430,455,48.59,51.41
+Bot,295,65,230,22.03,77.97
+DDoS,19205,19001,204,98.94,1.06
+DoS Slowhttptest,825,685,140,83.03,16.97
+DoS slowloris,870,758,112,87.13,12.87
+Web Attack - Brute Force,227,196,31,86.34,13.66
+DoS GoldenEye,1544,1532,12,99.22,0.78
+Web Attack - XSS,98,88,10,89.8,10.2
 Infiltration,6,0,6,0.0,100.0
-DoS GoldenEye,1544,1544,0,100.0,0.0
-DDoS,19205,19205,0,100.0,0.0
-DoS slowloris,870,870,0,100.0,0.0
-FTP-Patator,1191,1191,0,100.0,0.0
-Heartbleed,2,2,0,100.0,0.0
-PortScan,23840,23840,0,100.0,0.0
-SSH-Patator,885,885,0,100.0,0.0
-Web Attack - Brute Force,227,227,0,100.0,0.0
-Web Attack - Sql Injection,4,4,0,100.0,0.0
-Web Attack - XSS,98,98,0,100.0,0.0
+Web Attack - Sql Injection,4,0,4,0.0,100.0
+Heartbleed,2,1,1,50.0,50.0
